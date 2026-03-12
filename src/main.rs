@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, Utc, Weekday};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Timelike, Utc, Weekday};
 use serenity::{
     async_trait,
     builder::GetMessages,
@@ -10,8 +10,9 @@ use serenity::{
     },
     prelude::*,
 };
- use std::env;
- use tokio::time::{sleep, Duration};
+use std::collections::HashMap;
+use std::env;
+use tokio::time::{sleep, Duration};
 
  struct Handler {
      target_guild: GuildId,
@@ -107,11 +108,17 @@ fn next_monday_9_utc(now: DateTime<Utc>) -> DateTime<Utc> {
          all_members.append(&mut members);
      }
 
-     // 2) 지난 1주일 동안의 메시지들에서 작성자 수집
+    // 2) 지난 1주일 동안의 메시지들에서 "각 유저의 첫 메시지 시각" 수집
      let now = Utc::now();
      let one_week_ago = now - ChronoDuration::days(7);
+    let today_midnight = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("유효한 시간이어야 합니다.")
+        .and_utc();
 
-    let mut message_authors = std::collections::HashSet::new();
+   // user_id -> 지난 1주일 내 첫 메시지 시각
+   let mut first_message_times: HashMap<serenity::model::id::UserId, DateTime<Utc>> = HashMap::new();
     let mut before: Option<MessageId> = None;
 
     'outer: loop {
@@ -121,7 +128,7 @@ fn next_monday_9_utc(now: DateTime<Utc>) -> DateTime<Utc> {
             builder = builder.before(b);
         }
 
-        let messages = channel_id.messages(http, builder).await?;
+       let messages = channel_id.messages(http, builder).await?;
 
          if messages.is_empty() {
              break;
@@ -134,7 +141,13 @@ fn next_monday_9_utc(now: DateTime<Utc>) -> DateTime<Utc> {
              }
 
              if !msg.author.bot {
-                 message_authors.insert(msg.author.id);
+                 let entry = first_message_times
+                     .entry(msg.author.id)
+                     .or_insert(msg.timestamp);
+
+                 if msg.timestamp < *entry {
+                     *entry = msg.timestamp;
+                 }
              }
          }
 
@@ -147,31 +160,58 @@ fn next_monday_9_utc(now: DateTime<Utc>) -> DateTime<Utc> {
         }
      }
 
-     // 3) 비활성(발언하지 않은) 유저 필터링
-     let inactive: Vec<_> = all_members
-         .into_iter()
-         .filter(|m| !m.user.bot)
-         .filter(|m| !message_authors.contains(&m.user.id))
-         .collect();
+     // 3) 비활성(발언하지 않은) 유저, 지각(월요일 00:00~09:00에만 작성) 유저 분류
+     let mut absent = Vec::new(); // 완전 미참여 (경고 1회)
+     let mut late = Vec::new();   // 월요일 00:00~09:00 사이에 첫 메시지 (지각)
 
-     if inactive.is_empty() {
+     for member in all_members.into_iter().filter(|m| !m.user.bot) {
+         if let Some(first_ts) = first_message_times.get(&member.user.id) {
+             // 지난 1주일 내에 메시지는 있지만, 그 첫 메시지가 오늘(월요일) 00:00~09:00 사이라면 지각
+             if *first_ts >= today_midnight && *first_ts <= now {
+                 late.push(member);
+             }
+         } else {
+             // 지난 1주일 동안 메시지가 전혀 없음 → 결석
+             absent.push(member);
+         }
+     }
+
+     if absent.is_empty() && late.is_empty() {
          channel_id
              .say(http, "지난 1주일 동안 이 채널에는 모두가 참여했습니다!")
              .await?;
          return Ok(());
      }
 
-     let mention_list = inactive
-         .iter()
-         .map(|m| format!("<@{}>", m.user.id))
-         .collect::<Vec<_>>()
-         .join(" ");
+     let mut parts = Vec::new();
 
-    let content = format!(
-        "지난 1주일 동안 (월요일 09:00 기준) 이 채널에 메시지를 남기지 않아 **경고 1회**를 받은 사람들:\n{}",
-        mention_list
-    );
+     if !absent.is_empty() {
+         let mention_list = absent
+             .iter()
+             .map(|m| format!("<@{}>", m.user.id))
+             .collect::<Vec<_>>()
+             .join(" ");
 
+         parts.push(format!(
+             "지난 1주일 동안 (월요일 09:00 기준) 이 채널에 메시지를 남기지 않아 **경고 1회 (결석)**를 받은 사람들:\n{}",
+             mention_list
+         ));
+     }
+
+     if !late.is_empty() {
+         let mention_list = late
+             .iter()
+             .map(|m| format!("<@{}>", m.user.id))
+             .collect::<Vec<_>>()
+             .join(" ");
+
+         parts.push(format!(
+             "지난 1주일 동안 월요일 00:00~09:00 사이에 처음으로 메시지를 남겨 **지각 1회**를 받은 사람들:\n{}",
+             mention_list
+         ));
+     }
+
+     let content = parts.join("\n\n");
      channel_id.say(http, content).await?;
 
      Ok(())
