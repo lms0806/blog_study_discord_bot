@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, Timelike, Utc, Weekday};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Utc, Weekday};
 use serenity::{
     async_trait,
     builder::GetMessages,
