@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, Timelike, Utc, Weekday};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Utc, Weekday};
 use serenity::{
     async_trait,
     builder::GetMessages,
@@ -117,7 +117,7 @@ fn next_monday_9_utc(now: DateTime<Utc>) -> DateTime<Utc> {
         .expect("유효한 시간이어야 합니다.")
         .and_utc();
 
-   // user_id -> 지난 1주일 내 첫 메시지 시각
+   // user_id -> 지난 1주일 내 첫 메시지 시각 (UTC)
    let mut first_message_times: HashMap<serenity::model::id::UserId, DateTime<Utc>> = HashMap::new();
     let mut before: Option<MessageId> = None;
 
@@ -143,10 +143,11 @@ fn next_monday_9_utc(now: DateTime<Utc>) -> DateTime<Utc> {
              if !msg.author.bot {
                  let entry = first_message_times
                      .entry(msg.author.id)
-                     .or_insert(msg.timestamp);
+                     .or_insert(msg.timestamp.to_utc());
 
-                 if msg.timestamp < *entry {
-                     *entry = msg.timestamp;
+                 let msg_time = msg.timestamp.to_utc();
+                 if msg_time < *entry {
+                     *entry = msg_time;
                  }
              }
          }
