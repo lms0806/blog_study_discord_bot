@@ -1,0 +1,14 @@
+ [package]
+ name = "blog_study_discord_bot"
+ version = "0.1.0"
+ edition = "2021"
+
+ [dependencies]
+ serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "rustls_backend", "model", "cache", "chrono"] }
+ tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread", "time"] }
+ chrono = { version = "0.4.44", features = ["serde"] }
+ dotenvy = "0.15.7"
+ anyhow = "1.0.102"
+
+ [profile.release]
+ opt-level = 3
