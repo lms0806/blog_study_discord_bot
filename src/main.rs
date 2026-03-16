@@ -177,10 +177,11 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
 
     // 비교는 모두 UTC로 하므로, 기준 시각을 다시 UTC로 변환
     let this_monday_midnight_utc = this_monday_midnight_kst.with_timezone(&Utc);
-    let last_monday_midnight_utc = this_monday_midnight_utc - ChronoDuration::days(7);
-    let this_monday_9_kst = this_monday_midnight_kst
-        + ChronoDuration::hours(9);
+    let this_monday_9_kst = this_monday_midnight_kst + ChronoDuration::hours(9);
     let this_monday_9_utc = this_monday_9_kst.with_timezone(&Utc);
+    // "지난주 월요일 09:00(KST)" 기준
+    let last_monday_9_kst = this_monday_9_kst - ChronoDuration::days(7);
+    let last_monday_9_utc = last_monday_9_kst.with_timezone(&Utc);
 
     // user_id -> 해당 주간 내 첫 메시지 시각 (UTC)
     let mut first_message_times: HashMap<serenity::model::id::UserId, DateTime<Utc>> = HashMap::new();
@@ -200,8 +201,8 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
         }
 
         for msg in &messages {
-            if msg.timestamp < last_monday_midnight_utc.into() {
-                // 지난주 월요일 00:00(KST 기준) 이전 메시지에 도달하면 중단
+            if msg.timestamp < last_monday_9_utc.into() {
+                // 지난주 월요일 09:00(KST 기준) 이전 메시지에 도달하면 중단
                 break 'outer;
             }
 
@@ -227,15 +228,15 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
     }
 
     // 3) 분류
-    // - 지난주 월요일 00:00 ~ 이번주 월요일 09:00까지 한 번도 작성하지 않으면: 경고
-    // - 지난주 월요일 00:00 ~ 이번주 월요일 00:00까지 작성하지 않았으나,
+    // - 지난주 월요일 09:00 ~ 이번주 월요일 09:00까지 한 번도 작성하지 않으면: 경고
+    // - 지난주 월요일 09:00 ~ 이번주 월요일 00:00까지 작성하지 않았으나,
     //   이번주 월요일 00:00 ~ 09:00 사이에 처음 작성하면: 지각
     let mut warn = Vec::new(); // 완전 미참여 (경고)
     let mut late = Vec::new(); // 이번주 월요일 00:00~09:00 첫 작성 (지각)
 
     for member in all_members.into_iter().filter(|m| !m.user.bot) {
         if let Some(first_ts) = first_message_times.get(&member.user.id) {
-            // 지난주 월요일 00:00 ~ 이번주 월요일 00:00 전에 작성한 경우 → 정상 참여로 간주
+            // 지난주 월요일 09:00 ~ 이번주 월요일 00:00 전에 작성한 경우 → 정상 참여로 간주
             if *first_ts < this_monday_midnight_utc {
                 continue;
             }
@@ -249,14 +250,14 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
                 warn.push(member);
             }
         } else {
-            // 지난주 월요일 00:00 ~ 이번주 월요일 09:00까지 메시지가 전혀 없음 → 경고
+            // 지난주 월요일 09:00 ~ 이번주 월요일 09:00까지 메시지가 전혀 없음 → 경고
             warn.push(member);
         }
     }
 
     if warn.is_empty() && late.is_empty() {
         channel_id
-            .say(http, "지난주 월요일 00:00부터 이번주 월요일 09:00까지 모두 참여해서, 경고나 지각 대상자가 없습니다!")
+            .say(http, "지난주 월요일 09:00부터 이번주 월요일 09:00까지 모두 참여해서, 경고나 지각 대상자가 없습니다!")
             .await?;
         return Ok(());
     }
@@ -271,7 +272,7 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
             .join(" ");
 
         parts.push(format!(
-            "지난주 월요일 00:00부터 이번주 월요일 09:00까지 이 스레드에 메시지를 남기지 않아 **경고 1회**를 받은 사람들:\n{}",
+            "지난주 월요일 09:00부터 이번주 월요일 09:00까지 이 스레드에 메시지를 남기지 않아 **경고 1회**를 받은 사람들:\n{}",
             mention_list
         ));
     }
