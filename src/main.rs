@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, Utc, Weekday};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, FixedOffset, TimeZone, Utc, Weekday};
 use serenity::{
     async_trait,
     builder::{CreateThread, GetMessages},
@@ -14,28 +14,41 @@ use std::collections::HashMap;
 use std::env;
 use tokio::time::{sleep, Duration};
 
- struct Handler {
-     target_guild: GuildId,
-     target_channel: ChannelId,
- }
+struct Handler {
+    target_guild: GuildId,
+    target_channel: ChannelId,
+}
 
-/// 현재 시각 기준, "다음 월요일 09:00 (UTC)" DateTime을 계산
-fn next_monday_9_utc(now: DateTime<Utc>) -> DateTime<Utc> {
-    let weekday = now.weekday();
+/// 한국 시간대(KST, UTC+9) 오프셋
+fn kst_offset() -> FixedOffset {
+    FixedOffset::east_opt(9 * 60 * 60).expect("UTC+9 오프셋 생성 실패")
+}
 
-    // 오늘 날짜의 09:00 (UTC)
-    let today_nine = now
-        .date_naive()
-        .and_hms_opt(9, 0, 0)
-        .expect("유효한 시간이어야 합니다.")
-        .and_utc();
+/// 현재 시각(UTC) 기준, "다음 월요일 09:00 (KST)" 시각을 UTC로 계산
+fn next_monday_9_kst_as_utc(now_utc: DateTime<Utc>) -> DateTime<Utc> {
+    let kst = kst_offset();
+    let now_kst = now_utc.with_timezone(&kst);
+    let weekday = now_kst.weekday();
 
-    // 오늘이 월요일이고, 아직 09:00 전이면 오늘 09:00에 실행
-    if weekday == Weekday::Mon && now < today_nine {
-        return today_nine;
+    // 오늘 날짜의 09:00 (KST)
+    let today_nine_kst = kst
+        .with_ymd_and_hms(
+            now_kst.year(),
+            now_kst.month(),
+            now_kst.day(),
+            9,
+            0,
+            0,
+        )
+        .single()
+        .expect("유효한 시간이어야 합니다.");
+
+    // 오늘이 월요일이고, 아직 09:00(KST) 전이면 오늘 09:00(KST)에 실행
+    if weekday == Weekday::Mon && now_kst < today_nine_kst {
+        return today_nine_kst.with_timezone(&Utc);
     }
 
-    // 그 외에는 "다음" 월요일 09:00을 찾는다.
+    // 그 외에는 "다음" 월요일 09:00(KST)을 찾는다.
     let days_from_monday = weekday.num_days_from_monday() as i64;
 
     // 오늘이 월요일(0)이면 7일 뒤, 그 외에는 (7 - days_from_monday)일 뒤가 다음 월요일
@@ -45,7 +58,8 @@ fn next_monday_9_utc(now: DateTime<Utc>) -> DateTime<Utc> {
         7 - days_from_monday
     };
 
-    today_nine + ChronoDuration::days(days_until_next_monday)
+    let next_monday_kst = today_nine_kst + ChronoDuration::days(days_until_next_monday);
+    next_monday_kst.with_timezone(&Utc)
 }
 
  #[async_trait]
@@ -70,18 +84,19 @@ fn next_monday_9_utc(now: DateTime<Utc>) -> DateTime<Utc> {
 /// 해당 스레드의 메시지를 기준으로 출석/지각을 체크하는 태스크
 async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId) {
     loop {
-        // 현재 시각 기준, "다음 월요일 09:00(UTC)"까지 기다렸다가 실행
-        let now = Utc::now();
-        let next_run = next_monday_9_utc(now);
-        let diff = next_run - now;
+        // 현재 시각 기준, "다음 월요일 09:00(KST)"까지 기다렸다가 실행
+        let now_utc = Utc::now();
+        let next_run = next_monday_9_kst_as_utc(now_utc);
+        let diff = next_run - now_utc;
         let delay_secs = diff.num_seconds().max(0) as u64;
 
         sleep(Duration::from_secs(delay_secs)).await;
 
-        // 월요일 09:00(UTC)에 도달하면, 대상 채널에 새로운 스레드를 만든다.
+        // 한국 시간 기준 월요일 09:00에 도달하면, 대상 채널에 새로운 스레드를 만든다.
         let http = &ctx.http;
-        let today = Utc::now().date_naive();
-        let next_week = today + ChronoDuration::days(7);
+        let kst = kst_offset();
+        let today_kst = Utc::now().with_timezone(&kst).date_naive();
+        let next_week = today_kst + ChronoDuration::days(7);
         // 스레드 제목: "블로그\nMM/DD - MM/DD"
         let thread_name = format!(
             "블로그\n{} - {}",
@@ -134,13 +149,26 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
 
     // 2) "지난주 월요일 00:00 ~ 이번주 월요일 09:00" 구간의 메시지들에서
     //    각 유저의 "첫 메시지 시각"을 수집
-    let now = Utc::now();
-    let today_midnight = now
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .expect("유효한 시간이어야 합니다.")
-        .and_utc();
-    let last_monday_midnight = today_midnight - ChronoDuration::days(7);
+    let now_utc = Utc::now();
+    let kst = kst_offset();
+    let now_kst = now_utc.with_timezone(&kst);
+
+    // 오늘(한국 시간) 00:00 (KST)
+    let today_midnight_kst = kst
+        .with_ymd_and_hms(
+            now_kst.year(),
+            now_kst.month(),
+            now_kst.day(),
+            0,
+            0,
+            0,
+        )
+        .single()
+        .expect("유효한 시간이어야 합니다.");
+
+    // 비교는 모두 UTC로 하므로, 기준 시각을 다시 UTC로 변환
+    let today_midnight_utc = today_midnight_kst.with_timezone(&Utc);
+    let last_monday_midnight_utc = today_midnight_utc - ChronoDuration::days(7);
 
     // user_id -> 해당 주간 내 첫 메시지 시각 (UTC)
     let mut first_message_times: HashMap<serenity::model::id::UserId, DateTime<Utc>> = HashMap::new();
@@ -160,8 +188,8 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
         }
 
         for msg in &messages {
-            if msg.timestamp < last_monday_midnight.into() {
-                // 지난주 월요일 00:00 이전 메시지에 도달하면 중단
+            if msg.timestamp < last_monday_midnight_utc.into() {
+                // 지난주 월요일 00:00(KST 기준) 이전 메시지에 도달하면 중단
                 break 'outer;
             }
 
@@ -180,21 +208,21 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
         before = messages.last().map(|m| m.id);
 
         if let Some(last) = messages.last() {
-            if last.timestamp < last_monday_midnight.into() {
+            if last.timestamp < last_monday_midnight_utc.into() {
                 break;
             }
         }
     }
 
-    // 3) 결석(지난주 월요일 00:00~이번주 월요일 00:00까지 미작성),
-    //    지각(이번주 월요일 00:00~09:00 사이 첫 작성) 유저 분류
+    // 3) 결석(지난주 월요일 00:00~이번주 월요일 00:00까지 미작성, KST 기준),
+    //    지각(이번주 월요일 00:00~09:00 사이 첫 작성, KST 기준) 유저 분류
     let mut absent = Vec::new(); // 완전 미참여 (경고 1회)
     let mut late = Vec::new();   // 월요일 00:00~09:00 사이에 첫 메시지 (지각)
 
     for member in all_members.into_iter().filter(|m| !m.user.bot) {
         if let Some(first_ts) = first_message_times.get(&member.user.id) {
-            // 이번주 월요일 00:00~09:00 사이에 첫 메시지를 남긴 경우 → 지각
-            if *first_ts >= today_midnight && *first_ts <= now {
+            // 기준 시각도 KST 기준으로 계산되었으므로, 같은 기준으로 비교
+            if *first_ts >= today_midnight_utc && *first_ts <= now_utc {
                 late.push(member);
             }
             // 그 외(지난주 월요일 00:00~이번주 월요일 00:00 사이에 이미 작성)는 정상 참여로 간주
