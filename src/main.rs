@@ -83,6 +83,10 @@ fn next_monday_9_kst_as_utc(now_utc: DateTime<Utc>) -> DateTime<Utc> {
 /// 매주 월요일 09:00(UTC)에 스레드를 생성하고,
 /// 해당 스레드의 메시지를 기준으로 출석/지각을 체크하는 태스크
 async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId) {
+    // 직전 주 스레드 ID를 메모리에 유지한다.
+    // (봇이 재시작되면 초기화되지만, 기본 동작에는 큰 문제 없음)
+    let mut last_week_thread: Option<ChannelId> = None;
+
     loop {
         // 현재 시각 기준, "다음 월요일 09:00(KST)"까지 기다렸다가 실행
         let now_utc = Utc::now();
@@ -92,8 +96,16 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
 
         sleep(Duration::from_secs(delay_secs)).await;
 
-        // 한국 시간 기준 월요일 09:00에 도달하면, 대상 채널에 새로운 스레드를 만든다.
         let http = &ctx.http;
+
+        // 1) 먼저 직전 주 스레드에 대해 결석/지각 체크를 진행한다.
+        if let Some(prev_thread_id) = last_week_thread {
+            if let Err(e) = check_inactive_users(&ctx, guild_id, prev_thread_id).await {
+                eprintln!("weekly task error (check_inactive_users): {:?}", e);
+            }
+        }
+
+        // 2) 그 다음, 이번 주에 사용할 새 스레드를 생성한다.
         let kst = kst_offset();
         let today_kst = Utc::now().with_timezone(&kst).date_naive();
         let next_week = today_kst + ChronoDuration::days(7);
@@ -113,11 +125,8 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
             .await
         {
             Ok(thread_channel) => {
-                let thread_channel_id = thread_channel.id;
-
-                if let Err(e) = check_inactive_users(&ctx, guild_id, thread_channel_id).await {
-                    eprintln!("weekly task error (check_inactive_users): {:?}", e);
-                }
+                // 방금 만든 스레드를 다음 주 체크 대상으로 저장
+                last_week_thread = Some(thread_channel.id);
             }
             Err(e) => {
                 eprintln!("failed to create weekly thread: {:?}", e);
@@ -153,8 +162,8 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
     let kst = kst_offset();
     let now_kst = now_utc.with_timezone(&kst);
 
-    // 오늘(한국 시간) 00:00 (KST)
-    let today_midnight_kst = kst
+    // 기준: "이번주 월요일 00:00(KST)"
+    let this_monday_midnight_kst = kst
         .with_ymd_and_hms(
             now_kst.year(),
             now_kst.month(),
@@ -167,8 +176,11 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
         .expect("유효한 시간이어야 합니다.");
 
     // 비교는 모두 UTC로 하므로, 기준 시각을 다시 UTC로 변환
-    let today_midnight_utc = today_midnight_kst.with_timezone(&Utc);
-    let last_monday_midnight_utc = today_midnight_utc - ChronoDuration::days(7);
+    let this_monday_midnight_utc = this_monday_midnight_kst.with_timezone(&Utc);
+    let last_monday_midnight_utc = this_monday_midnight_utc - ChronoDuration::days(7);
+    let this_monday_9_kst = this_monday_midnight_kst
+        + ChronoDuration::hours(9);
+    let this_monday_9_utc = this_monday_9_kst.with_timezone(&Utc);
 
     // user_id -> 해당 주간 내 첫 메시지 시각 (UTC)
     let mut first_message_times: HashMap<serenity::model::id::UserId, DateTime<Utc>> = HashMap::new();
@@ -193,6 +205,11 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
                 break 'outer;
             }
 
+            // 이번주 월요일 09:00(KST) 이후 메시지는 이번 체크 기준 밖이므로 무시
+            if msg.timestamp > this_monday_9_utc.into() {
+                continue;
+            }
+
             if !msg.author.bot {
                 let msg_time = msg.timestamp.to_utc();
                 let entry = first_message_times
@@ -207,49 +224,54 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
 
         before = messages.last().map(|m| m.id);
 
-        if let Some(last) = messages.last() {
-            if last.timestamp < last_monday_midnight_utc.into() {
-                break;
-            }
-        }
     }
 
-    // 3) 결석(지난주 월요일 00:00~이번주 월요일 00:00까지 미작성, KST 기준),
-    //    지각(이번주 월요일 00:00~09:00 사이 첫 작성, KST 기준) 유저 분류
-    let mut absent = Vec::new(); // 완전 미참여 (경고 1회)
-    let mut late = Vec::new();   // 월요일 00:00~09:00 사이에 첫 메시지 (지각)
+    // 3) 분류
+    // - 지난주 월요일 00:00 ~ 이번주 월요일 09:00까지 한 번도 작성하지 않으면: 경고
+    // - 지난주 월요일 00:00 ~ 이번주 월요일 00:00까지 작성하지 않았으나,
+    //   이번주 월요일 00:00 ~ 09:00 사이에 처음 작성하면: 지각
+    let mut warn = Vec::new(); // 완전 미참여 (경고)
+    let mut late = Vec::new(); // 이번주 월요일 00:00~09:00 첫 작성 (지각)
 
     for member in all_members.into_iter().filter(|m| !m.user.bot) {
         if let Some(first_ts) = first_message_times.get(&member.user.id) {
-            // 기준 시각도 KST 기준으로 계산되었으므로, 같은 기준으로 비교
-            if *first_ts >= today_midnight_utc && *first_ts <= now_utc {
-                late.push(member);
+            // 지난주 월요일 00:00 ~ 이번주 월요일 00:00 전에 작성한 경우 → 정상 참여로 간주
+            if *first_ts < this_monday_midnight_utc {
+                continue;
             }
-            // 그 외(지난주 월요일 00:00~이번주 월요일 00:00 사이에 이미 작성)는 정상 참여로 간주
+
+            // 이번주 월요일 00:00 ~ 09:00 사이에 처음 작성 → 지각
+            if *first_ts >= this_monday_midnight_utc && *first_ts <= this_monday_9_utc {
+                late.push(member);
+            } else {
+                // 그 외 (예: 이번주 월요일 09:00 이후에 처음 작성) → 이번 체크 기준에서는
+                // "이번주 월요일 09시까지 작성하지 않음"이므로 경고
+                warn.push(member);
+            }
         } else {
-            // 지난주 월요일 00:00~이번주 월요일 00:00까지 메시지가 전혀 없음 → 결석
-            absent.push(member);
+            // 지난주 월요일 00:00 ~ 이번주 월요일 09:00까지 메시지가 전혀 없음 → 경고
+            warn.push(member);
         }
     }
 
-    if absent.is_empty() && late.is_empty() {
+    if warn.is_empty() && late.is_empty() {
         channel_id
-            .say(http, "지난주 월요일 00:00부터 이번주 월요일 09:00까지 모두 참여했습니다!")
+            .say(http, "지난주 월요일 00:00부터 이번주 월요일 09:00까지 모두 참여해서, 경고나 지각 대상자가 없습니다!")
             .await?;
         return Ok(());
     }
 
     let mut parts = Vec::new();
 
-    if !absent.is_empty() {
-        let mention_list = absent
+    if !warn.is_empty() {
+        let mention_list = warn
             .iter()
             .map(|m| format!("<@{}>", m.user.id))
             .collect::<Vec<_>>()
             .join(" ");
 
         parts.push(format!(
-            "지난주 월요일 00:00부터 이번주 월요일 00:00까지 이 채널에 메시지를 남기지 않아 **경고 1회 (결석)**를 받은 사람들:\n{}",
+            "지난주 월요일 00:00부터 이번주 월요일 09:00까지 이 스레드에 메시지를 남기지 않아 **경고 1회**를 받은 사람들:\n{}",
             mention_list
         ));
     }
