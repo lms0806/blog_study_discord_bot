@@ -112,7 +112,7 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
         // 스레드 제목: "블로그\nMM/DD - MM/DD"
         let thread_name = format!(
             "블로그\n{} - {}",
-            today.format("%m/%d"),
+            today_kst.format("%m/%d"),
             next_week.format("%m/%d")
         );
 
