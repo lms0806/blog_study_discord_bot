@@ -2,9 +2,9 @@ use anyhow::Result;
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Utc, Weekday};
 use serenity::{
     async_trait,
-    builder::GetMessages,
+    builder::{CreateThread, GetMessages},
     model::{
-        channel::Message,
+        channel::{ChannelType, Message},
         gateway::Ready,
         id::{ChannelId, GuildId, MessageId},
     },
@@ -66,7 +66,8 @@ fn next_monday_9_utc(now: DateTime<Utc>) -> DateTime<Utc> {
      }
  }
 
-/// 매주 월요일 09:00(UTC)에 비활성 유저를 체크하는 태스크
+/// 매주 월요일 09:00(UTC)에 스레드를 생성하고,
+/// 해당 스레드의 메시지를 기준으로 출석/지각을 체크하는 태스크
 async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId) {
     loop {
         // 현재 시각 기준, "다음 월요일 09:00(UTC)"까지 기다렸다가 실행
@@ -77,8 +78,35 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
 
         sleep(Duration::from_secs(delay_secs)).await;
 
-        if let Err(e) = check_inactive_users(&ctx, guild_id, channel_id).await {
-            eprintln!("weekly task error: {:?}", e);
+        // 월요일 09:00(UTC)에 도달하면, 대상 채널에 새로운 스레드를 만든다.
+        let http = &ctx.http;
+        let today = Utc::now().date_naive();
+        let next_week = today + ChronoDuration::days(7);
+        // 스레드 제목: "블로그\nMM/DD - MM/DD"
+        let thread_name = format!(
+            "블로그\n{} - {}",
+            today.format("%m/%d"),
+            next_week.format("%m/%d")
+        );
+
+        match channel_id
+            .create_thread(
+                http,
+                CreateThread::new(thread_name)
+                    .kind(ChannelType::PublicThread),
+            )
+            .await
+        {
+            Ok(thread_channel) => {
+                let thread_channel_id = thread_channel.id;
+
+                if let Err(e) = check_inactive_users(&ctx, guild_id, thread_channel_id).await {
+                    eprintln!("weekly task error (check_inactive_users): {:?}", e);
+                }
+            }
+            Err(e) => {
+                eprintln!("failed to create weekly thread: {:?}", e);
+            }
         }
     }
 }
