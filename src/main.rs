@@ -3,6 +3,7 @@ use chrono::{DateTime, Datelike, Duration as ChronoDuration, FixedOffset, TimeZo
 use serenity::{
     async_trait,
     builder::{CreateThread, GetMessages},
+    http::Http,
     model::{
         channel::{ChannelType, Message},
         gateway::Ready,
@@ -80,13 +81,69 @@ fn next_monday_9_kst_as_utc(now_utc: DateTime<Utc>) -> DateTime<Utc> {
      }
  }
 
+/// 부모 텍스트 채널에 연결된 스레드 중, 생성 시각이 가장 늦은 것(스레드 ID가 가장 큰 것)을 고른다.
+/// 활성 스레드(길드 조회)와 보관된 공개 스레드(부모 채널 기준 페이지네이션)를 모두 본다.
+async fn newest_thread_under_parent(
+    http: &Http,
+    guild_id: GuildId,
+    parent_channel_id: ChannelId,
+) -> Result<Option<ChannelId>> {
+    fn is_thread_kind(k: ChannelType) -> bool {
+        matches!(
+            k,
+            ChannelType::PublicThread | ChannelType::PrivateThread | ChannelType::NewsThread
+        )
+    }
+
+    let mut best: Option<ChannelId> = None;
+
+    let active = guild_id.get_active_threads(http).await?;
+    for t in active.threads {
+        if t.parent_id == Some(parent_channel_id) && is_thread_kind(t.kind) {
+            best = Some(match best {
+                Some(b) if b.get() >= t.id.get() => b,
+                _ => t.id,
+            });
+        }
+    }
+
+    let mut before: Option<u64> = None;
+    loop {
+        let page = parent_channel_id
+            .get_archived_public_threads(http, before, Some(100))
+            .await?;
+        if page.threads.is_empty() {
+            break;
+        }
+
+        for t in &page.threads {
+            if is_thread_kind(t.kind) {
+                best = Some(match best {
+                    Some(b) if b.get() >= t.id.get() => b,
+                    _ => t.id,
+                });
+            }
+        }
+
+        if !page.has_more {
+            break;
+        }
+
+        let min_id = page
+            .threads
+            .iter()
+            .map(|c| c.id.get())
+            .min()
+            .expect("threads 비어 있지 않음");
+        before = Some(min_id);
+    }
+
+    Ok(best)
+}
+
 /// 매주 월요일 09:00(UTC)에 스레드를 생성하고,
 /// 해당 스레드의 메시지를 기준으로 출석/지각을 체크하는 태스크
 async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId) {
-    // 직전 주 스레드 ID를 메모리에 유지한다.
-    // (봇이 재시작되면 초기화되지만, 기본 동작에는 큰 문제 없음)
-    let mut last_week_thread: Option<ChannelId> = None;
-
     loop {
         // 현재 시각 기준, "다음 월요일 09:00(KST)"까지 기다렸다가 실행
         let now_utc = Utc::now();
@@ -98,14 +155,27 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
 
         let http = &ctx.http;
 
-        // 1) 먼저 직전 주 스레드에 대해 결석/지각 체크를 진행한다.
-        if let Some(prev_thread_id) = last_week_thread {
-            if let Err(e) = check_inactive_users(&ctx, guild_id, prev_thread_id).await {
-                eprintln!("weekly task error (check_inactive_users): {:?}", e);
+        // 1) 부모 채널에 달린 스레드 중 가장 최근에 생성된 스레드(스레드 ID 최대)를 기준으로 결석/지각 체크
+        match newest_thread_under_parent(http, guild_id, channel_id).await {
+            Ok(Some(thread_id)) => {
+                if let Err(e) =
+                    check_inactive_users(&ctx, guild_id, channel_id, thread_id).await
+                {
+                    eprintln!("weekly task error (check_inactive_users): {:?}", e);
+                }
+            }
+            Ok(None) => {
+                eprintln!(
+                    "weekly task: 부모 채널 {:?}에 확인할 스레드가 없어 출석 체크를 건너뜁니다.",
+                    channel_id
+                );
+            }
+            Err(e) => {
+                eprintln!("weekly task error (newest_thread_under_parent): {:?}", e);
             }
         }
 
-        // 2) 그 다음, 이번 주에 사용할 새 스레드를 생성한다.
+        // 2) 이번 주에 사용할 새 스레드를 생성한다.
         let kst = kst_offset();
         let today_kst = Utc::now().with_timezone(&kst).date_naive();
         let next_week = today_kst + ChronoDuration::days(6);
@@ -124,10 +194,7 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
             )
             .await
         {
-            Ok(thread_channel) => {
-                // 방금 만든 스레드를 다음 주 체크 대상으로 저장
-                last_week_thread = Some(thread_channel.id);
-            }
+            Ok(_thread_channel) => {}
             Err(e) => {
                 eprintln!("failed to create weekly thread: {:?}", e);
             }
@@ -139,7 +206,14 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
 /// - 월요일 00:00까지 한 번도 작성하지 않은 유저: 결석(경고)
 /// - 월요일 00:00~09:00 사이에 처음 작성한 유저: 지각
 /// 를 태그해서 알려준다.
-async fn check_inactive_users(ctx: &Context, guild_id: GuildId, channel_id: ChannelId) -> Result<()> {
+/// `post_channel_id`: 경고/지각 안내를 올릴 채널(부모 텍스트 채널).
+/// `message_source_thread_id`: 출석·지각 판정에 사용할 메시지를 읽어올 스레드(가장 최근에 생성된 스레드).
+async fn check_inactive_users(
+    ctx: &Context,
+    guild_id: GuildId,
+    post_channel_id: ChannelId,
+    message_source_thread_id: ChannelId,
+) -> Result<()> {
      let http = &ctx.http;
 
     // 1) 길드 멤버 전체 목록 가져오기 (페이지네이션)
@@ -194,7 +268,7 @@ async fn check_inactive_users(ctx: &Context, guild_id: GuildId, channel_id: Chan
             builder = builder.before(b);
         }
 
-        let messages = channel_id.messages(http, builder).await?;
+        let messages = message_source_thread_id.messages(http, builder).await?;
 
         if messages.is_empty() {
             break;
@@ -224,7 +298,6 @@ async fn check_inactive_users(ctx: &Context, guild_id: GuildId, channel_id: Chan
         }
 
         before = messages.last().map(|m| m.id);
-
     }
 
     // 3) 분류
@@ -256,7 +329,7 @@ async fn check_inactive_users(ctx: &Context, guild_id: GuildId, channel_id: Chan
     }
 
     if warn.is_empty() && late.is_empty() {
-        channel_id
+        post_channel_id
             .say(http, "지난주 월요일 09:00부터 이번주 월요일 09:00까지 모두 참여해서, 경고나 지각 대상자가 없습니다!")
             .await?;
         return Ok(());
@@ -272,7 +345,7 @@ async fn check_inactive_users(ctx: &Context, guild_id: GuildId, channel_id: Chan
             .join(" ");
 
         parts.push(format!(
-            "지난주 월요일 09:00부터 이번주 월요일 09:00까지 이 스레드에 메시지를 남기지 않아 **경고 1회**를 받은 사람들:\n{}",
+            "지난주 월요일 09:00부터 이번주 월요일 09:00까지, 이 채널에서 가장 최근에 만들어진 스레드에 메시지를 남기지 않아 **경고 1회**를 받은 사람들:\n{}",
             mention_list
         ));
     }
@@ -285,13 +358,13 @@ async fn check_inactive_users(ctx: &Context, guild_id: GuildId, channel_id: Chan
             .join(" ");
 
         parts.push(format!(
-            "이번주 월요일 00:00~09:00 사이에 처음으로 메시지를 남겨 **지각 1회**를 받은 사람들:\n{}",
+            "이번주 월요일 00:00~09:00 사이에, 위 스레드에 처음으로 메시지를 남겨 **지각 1회**를 받은 사람들:\n{}",
             mention_list
         ));
     }
 
     let content = parts.join("\n\n");
-    channel_id.say(http, content).await?;
+    post_channel_id.say(http, content).await?;
 
     Ok(())
 }
