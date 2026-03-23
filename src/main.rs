@@ -64,6 +64,11 @@ fn next_monday_9_kst_as_utc(now_utc: DateTime<Utc>) -> DateTime<Utc> {
 
  #[async_trait]
  impl EventHandler for Handler {
+     // 필요 시 메시지 이벤트 처리도 추가 가능
+     async fn message(&self, _ctx: Context, _msg: Message) {
+         // 현재는 사용하지 않지만, 나중에 명령어 등을 붙이고 싶을 때 활용
+     }
+
      async fn ready(&self, ctx: Context, ready: Ready) {
          println!("Logged in as {}", ready.user.name);
 
@@ -72,11 +77,6 @@ fn next_monday_9_kst_as_utc(now_utc: DateTime<Utc>) -> DateTime<Utc> {
          let channel_id = self.target_channel;
 
          tokio::spawn(run_weekly_task(ctx.clone(), guild_id, channel_id));
-     }
-
-     // 필요 시 메시지 이벤트 처리도 추가 가능
-     async fn message(&self, _ctx: Context, _msg: Message) {
-         // 현재는 사용하지 않지만, 나중에 명령어 등을 붙이고 싶을 때 활용
      }
  }
 
@@ -108,7 +108,7 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
         // 2) 그 다음, 이번 주에 사용할 새 스레드를 생성한다.
         let kst = kst_offset();
         let today_kst = Utc::now().with_timezone(&kst).date_naive();
-        let next_week = today_kst + ChronoDuration::days(7);
+        let next_week = today_kst + ChronoDuration::days(6);
         // 스레드 제목: "블로그\nMM/DD - MM/DD"
         let thread_name = format!(
             "블로그\n{} - {}",
@@ -139,7 +139,7 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
 /// - 월요일 00:00까지 한 번도 작성하지 않은 유저: 결석(경고)
 /// - 월요일 00:00~09:00 사이에 처음 작성한 유저: 지각
 /// 를 태그해서 알려준다.
- async fn check_inactive_users(ctx: &Context, guild_id: GuildId, channel_id: ChannelId) -> Result<()> {
+async fn check_inactive_users(ctx: &Context, guild_id: GuildId, channel_id: ChannelId) -> Result<()> {
      let http = &ctx.http;
 
     // 1) 길드 멤버 전체 목록 가져오기 (페이지네이션)
