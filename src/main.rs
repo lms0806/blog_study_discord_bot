@@ -63,6 +63,25 @@ fn next_monday_9_kst_as_utc(now_utc: DateTime<Utc>) -> DateTime<Utc> {
     next_monday_kst.with_timezone(&Utc)
 }
 
+/// 현재 시각(KST)을 기준으로, 그 주의 월요일 00:00(KST)을 구한다.
+fn this_week_monday_midnight_kst(now_kst: DateTime<FixedOffset>) -> DateTime<FixedOffset> {
+    let kst = kst_offset();
+    let weekday = now_kst.weekday();
+    let days_from_monday = weekday.num_days_from_monday() as i64;
+
+    let monday_date = now_kst.date_naive() - ChronoDuration::days(days_from_monday);
+    kst.with_ymd_and_hms(
+        monday_date.year(),
+        monday_date.month(),
+        monday_date.day(),
+        0,
+        0,
+        0,
+    )
+    .single()
+    .expect("유효한 시간이어야 합니다.")
+}
+
  #[async_trait]
  impl EventHandler for Handler {
      // 필요 시 메시지 이벤트 처리도 추가 가능
@@ -141,16 +160,22 @@ async fn newest_thread_under_parent(
     Ok(best)
 }
 
-/// 매주 월요일 09:00(UTC)에 스레드를 생성하고,
+/// 매주 월요일 09:00(KST)에 스레드를 생성하고,
 /// 해당 스레드의 메시지를 기준으로 출석/지각을 체크하는 태스크
 async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId) {
     loop {
         // 현재 시각 기준, "다음 월요일 09:00(KST)"까지 기다렸다가 실행
         let now_utc = Utc::now();
         let next_run = next_monday_9_kst_as_utc(now_utc);
+        let kst = kst_offset();
+        let next_run_kst = next_run.with_timezone(&kst);
         let diff = next_run - now_utc;
         let delay_secs = diff.num_seconds().max(0) as u64;
 
+        println!(
+            "weekly schedule: now_utc={}, next_run_utc={}, next_run_kst={}",
+            now_utc, next_run, next_run_kst
+        );
         sleep(Duration::from_secs(delay_secs)).await;
 
         let http = &ctx.http;
@@ -159,7 +184,7 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
         match newest_thread_under_parent(http, guild_id, channel_id).await {
             Ok(Some(thread_id)) => {
                 if let Err(e) =
-                    check_inactive_users(&ctx, guild_id, channel_id, thread_id).await
+                    check_inactive_users(&ctx, guild_id, channel_id, thread_id, next_run).await
                 {
                     eprintln!("weekly task error (check_inactive_users): {:?}", e);
                 }
@@ -176,13 +201,12 @@ async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId)
         }
 
         // 2) 이번 주에 사용할 새 스레드를 생성한다.
-        let kst = kst_offset();
-        let today_kst = Utc::now().with_timezone(&kst).date_naive();
-        let next_week = today_kst + ChronoDuration::days(6);
+        let scheduled_week_start_kst = next_run_kst.date_naive();
+        let next_week = scheduled_week_start_kst + ChronoDuration::days(6);
         // 스레드 제목: "블로그\nMM/DD - MM/DD"
         let thread_name = format!(
             "블로그\n{} - {}",
-            today_kst.format("%m/%d"),
+            scheduled_week_start_kst.format("%m/%d"),
             next_week.format("%m/%d")
         );
 
@@ -213,6 +237,7 @@ async fn check_inactive_users(
     guild_id: GuildId,
     post_channel_id: ChannelId,
     message_source_thread_id: ChannelId,
+    reference_utc: DateTime<Utc>,
 ) -> Result<()> {
      let http = &ctx.http;
 
@@ -232,22 +257,12 @@ async fn check_inactive_users(
 
     // 2) "지난주 월요일 00:00 ~ 이번주 월요일 09:00" 구간의 메시지들에서
     //    각 유저의 "첫 메시지 시각"을 수집
-    let now_utc = Utc::now();
+    let now_utc = reference_utc;
     let kst = kst_offset();
     let now_kst = now_utc.with_timezone(&kst);
 
     // 기준: "이번주 월요일 00:00(KST)"
-    let this_monday_midnight_kst = kst
-        .with_ymd_and_hms(
-            now_kst.year(),
-            now_kst.month(),
-            now_kst.day(),
-            0,
-            0,
-            0,
-        )
-        .single()
-        .expect("유효한 시간이어야 합니다.");
+    let this_monday_midnight_kst = this_week_monday_midnight_kst(now_kst);
 
     // 비교는 모두 UTC로 하므로, 기준 시각을 다시 UTC로 변환
     let this_monday_midnight_utc = this_monday_midnight_kst.with_timezone(&Utc);
