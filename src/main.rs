@@ -13,11 +13,14 @@ use serenity::{
 };
 use std::collections::HashMap;
 use std::env;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::time::{sleep, Duration};
 
 struct Handler {
     target_guild: GuildId,
     target_channel: ChannelId,
+    started: Arc<AtomicBool>,
 }
 
 /// 한국 시간대(KST, UTC+9) 오프셋
@@ -91,6 +94,10 @@ fn this_week_monday_midnight_kst(now_kst: DateTime<FixedOffset>) -> DateTime<Fix
 
      async fn ready(&self, ctx: Context, ready: Ready) {
          println!("Logged in as {}", ready.user.name);
+
+         if self.started.swap(true, Ordering::SeqCst) {
+             return;
+         }
 
          // 봇이 준비되면 주간 체크 태스크를 시작한다.
          let guild_id = self.target_guild;
@@ -407,6 +414,7 @@ async fn check_inactive_users(
     let handler = Handler {
         target_guild: GuildId::new(guild_id),
         target_channel: ChannelId::new(channel_id),
+        started: Arc::new(AtomicBool::new(false)),
     };
 
      let mut client = Client::builder(&token, intents)
