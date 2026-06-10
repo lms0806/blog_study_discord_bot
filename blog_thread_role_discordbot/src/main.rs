@@ -1,0 +1,460 @@
+use anyhow::Result;
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, FixedOffset, TimeZone, Utc, Weekday};
+use serenity::{
+    async_trait,
+    builder::{CreateThread, GetMessages},
+    http::Http,
+    model::{
+        channel::{ChannelType, Message},
+        gateway::Ready,
+        id::{ChannelId, GuildId, MessageId},
+    },
+    prelude::*,
+};
+use std::collections::HashMap;
+use std::env;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::time::{sleep, Duration};
+
+/// 출석 체크 대상 역할명
+const TARGET_ROLE_NAME: &str = "blog_study";
+
+struct Handler {
+    target_guild: GuildId,
+    target_channel: ChannelId,
+    started: Arc<AtomicBool>,
+}
+
+/// 한국 시간대(KST, UTC+9) 오프셋
+fn kst_offset() -> FixedOffset {
+    FixedOffset::east_opt(9 * 60 * 60).expect("UTC+9 오프셋 생성 실패")
+}
+
+/// 현재 시각(UTC) 기준, "다음 월요일 09:00 (KST)" 시각을 UTC로 계산
+fn next_monday_9_kst_as_utc(now_utc: DateTime<Utc>) -> DateTime<Utc> {
+    let kst = kst_offset();
+    let now_kst = now_utc.with_timezone(&kst);
+    let weekday = now_kst.weekday();
+
+    // 오늘 날짜의 09:00 (KST)
+    let today_nine_kst = kst
+        .with_ymd_and_hms(
+            now_kst.year(),
+            now_kst.month(),
+            now_kst.day(),
+            9,
+            0,
+            0,
+        )
+        .single()
+        .expect("유효한 시간이어야 합니다.");
+
+    // 오늘이 월요일이고, 아직 09:00(KST) 전이면 오늘 09:00(KST)에 실행
+    if weekday == Weekday::Mon && now_kst < today_nine_kst {
+        return today_nine_kst.with_timezone(&Utc);
+    }
+
+    // 그 외에는 "다음" 월요일 09:00(KST)을 찾는다.
+    let days_from_monday = weekday.num_days_from_monday() as i64;
+
+    // 오늘이 월요일(0)이면 7일 뒤, 그 외에는 (7 - days_from_monday)일 뒤가 다음 월요일
+    let days_until_next_monday = if days_from_monday == 0 {
+        7
+    } else {
+        7 - days_from_monday
+    };
+
+    let next_monday_kst = today_nine_kst + ChronoDuration::days(days_until_next_monday);
+    next_monday_kst.with_timezone(&Utc)
+}
+
+/// 현재 시각(KST)을 기준으로, 그 주의 월요일 00:00(KST)을 구한다.
+fn this_week_monday_midnight_kst(now_kst: DateTime<FixedOffset>) -> DateTime<FixedOffset> {
+    let kst = kst_offset();
+    let weekday = now_kst.weekday();
+    let days_from_monday = weekday.num_days_from_monday() as i64;
+
+    let monday_date = now_kst.date_naive() - ChronoDuration::days(days_from_monday);
+    kst.with_ymd_and_hms(
+        monday_date.year(),
+        monday_date.month(),
+        monday_date.day(),
+        0,
+        0,
+        0,
+    )
+    .single()
+    .expect("유효한 시간이어야 합니다.")
+}
+
+ #[async_trait]
+ impl EventHandler for Handler {
+     // 필요 시 메시지 이벤트 처리도 추가 가능
+     async fn message(&self, _ctx: Context, _msg: Message) {
+         // 현재는 사용하지 않지만, 나중에 명령어 등을 붙이고 싶을 때 활용
+     }
+
+     async fn ready(&self, ctx: Context, ready: Ready) {
+         println!("Logged in as {}", ready.user.name);
+
+         if self.started.swap(true, Ordering::SeqCst) {
+             return;
+         }
+
+         // 봇이 준비되면 주간 체크 태스크를 시작한다.
+         let guild_id = self.target_guild;
+         let channel_id = self.target_channel;
+
+         tokio::spawn(run_weekly_task(ctx.clone(), guild_id, channel_id));
+     }
+ }
+
+/// 부모 텍스트 채널에 연결된 스레드 중, 생성 시각이 가장 늦은 것(스레드 ID가 가장 큰 것)을 고른다.
+/// 활성 스레드(길드 조회)와 보관된 공개 스레드(부모 채널 기준 페이지네이션)를 모두 본다.
+async fn newest_thread_under_parent(
+    http: &Http,
+    guild_id: GuildId,
+    parent_channel_id: ChannelId,
+) -> Result<Option<ChannelId>> {
+    fn is_thread_kind(k: ChannelType) -> bool {
+        matches!(
+            k,
+            ChannelType::PublicThread | ChannelType::PrivateThread | ChannelType::NewsThread
+        )
+    }
+
+    let mut best: Option<ChannelId> = None;
+
+    let active = guild_id.get_active_threads(http).await?;
+    for t in active.threads {
+        if t.parent_id == Some(parent_channel_id) && is_thread_kind(t.kind) {
+            best = Some(match best {
+                Some(b) if b.get() >= t.id.get() => b,
+                _ => t.id,
+            });
+        }
+    }
+
+    let mut before: Option<u64> = None;
+    loop {
+        let page = parent_channel_id
+            .get_archived_public_threads(http, before, Some(100))
+            .await?;
+        if page.threads.is_empty() {
+            break;
+        }
+
+        for t in &page.threads {
+            if is_thread_kind(t.kind) {
+                best = Some(match best {
+                    Some(b) if b.get() >= t.id.get() => b,
+                    _ => t.id,
+                });
+            }
+        }
+
+        if !page.has_more {
+            break;
+        }
+
+        let min_id = page
+            .threads
+            .iter()
+            .map(|c| c.id.get())
+            .min()
+            .expect("threads 비어 있지 않음");
+        before = Some(min_id);
+    }
+
+    Ok(best)
+}
+
+/// 매주 월요일 09:00(KST)에 스레드를 생성하고,
+/// 해당 스레드의 메시지를 기준으로 출석/지각을 체크하는 태스크
+async fn run_weekly_task(ctx: Context, guild_id: GuildId, channel_id: ChannelId) {
+    loop {
+        // 현재 시각 기준, "다음 월요일 09:00(KST)"까지 기다렸다가 실행
+        let now_utc = Utc::now();
+        let next_run = next_monday_9_kst_as_utc(now_utc);
+        let kst = kst_offset();
+        let next_run_kst = next_run.with_timezone(&kst);
+        let diff = next_run - now_utc;
+        let delay_secs = diff.num_seconds().max(0) as u64;
+
+        println!(
+            "weekly schedule: now_utc={}, next_run_utc={}, next_run_kst={}",
+            now_utc, next_run, next_run_kst
+        );
+        sleep(Duration::from_secs(delay_secs)).await;
+
+        let http = &ctx.http;
+
+        // 1) 부모 채널에 달린 스레드 중 가장 최근에 생성된 스레드(스레드 ID 최대)를 기준으로 결석/지각 체크
+        match newest_thread_under_parent(http, guild_id, channel_id).await {
+            Ok(Some(thread_id)) => {
+                if let Err(e) =
+                    check_inactive_users(&ctx, guild_id, channel_id, thread_id, next_run).await
+                {
+                    eprintln!("weekly task error (check_inactive_users): {:?}", e);
+                }
+            }
+            Ok(None) => {
+                eprintln!(
+                    "weekly task: 부모 채널 {:?}에 확인할 스레드가 없어 출석 체크를 건너뜁니다.",
+                    channel_id
+                );
+            }
+            Err(e) => {
+                eprintln!("weekly task error (newest_thread_under_parent): {:?}", e);
+            }
+        }
+
+        // 2) 이번 주에 사용할 새 스레드를 생성한다.
+        let scheduled_week_start_kst = next_run_kst.date_naive();
+        let next_week = scheduled_week_start_kst + ChronoDuration::days(6);
+        // 스레드 제목: "블로그\nMM/DD - MM/DD"
+        let thread_name = format!(
+            "블로그\n{} - {}",
+            scheduled_week_start_kst.format("%m/%d"),
+            next_week.format("%m/%d")
+        );
+
+        match channel_id
+            .create_thread(
+                http,
+                CreateThread::new(thread_name)
+                    .kind(ChannelType::PublicThread),
+            )
+            .await
+        {
+            Ok(_thread_channel) => {}
+            Err(e) => {
+                eprintln!("failed to create weekly thread: {:?}", e);
+            }
+        }
+    }
+}
+
+/// 월요일 기준으로,
+/// - 월요일 00:00까지 한 번도 작성하지 않은 유저: 결석(경고)
+/// - 월요일 00:00~09:00 사이에 처음 작성한 유저: 지각
+/// 를 태그해서 알려준다.
+/// `post_channel_id`: 경고/지각 안내를 올릴 채널(부모 텍스트 채널).
+/// `message_source_thread_id`: 출석·지각 판정에 사용할 메시지를 읽어올 스레드(가장 최근에 생성된 스레드).
+async fn check_inactive_users(
+    ctx: &Context,
+    guild_id: GuildId,
+    post_channel_id: ChannelId,
+    message_source_thread_id: ChannelId,
+    reference_utc: DateTime<Utc>,
+) -> Result<()> {
+     let http = &ctx.http;
+
+    // 1) 길드 역할 중 출석 체크 대상 역할 찾기
+    let roles = guild_id.roles(http).await?;
+    let target_role_id = roles
+        .values()
+        .find(|r| r.name == TARGET_ROLE_NAME)
+        .map(|r| r.id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "'{}' 역할을 길드에서 찾을 수 없습니다.",
+                TARGET_ROLE_NAME
+            )
+        })?;
+
+    // 2) 길드 멤버 중 해당 역할을 가진 사용자만 가져오기 (페이지네이션)
+     let mut after = None;
+     let mut all_members = Vec::new();
+
+     loop {
+         let mut members = guild_id.members(http, Some(1000), after).await?;
+         if members.is_empty() {
+             break;
+         }
+
+         after = members.last().map(|m| m.user.id);
+         all_members.append(&mut members);
+     }
+
+    let target_members: Vec<_> = all_members
+        .into_iter()
+        .filter(|m| !m.user.bot && m.roles.contains(&target_role_id))
+        .collect();
+
+    // 3) "지난주 월요일 00:00 ~ 이번주 월요일 09:00" 구간의 메시지들에서
+    //    각 유저의 "첫 메시지 시각"을 수집
+    let now_utc = reference_utc;
+    let kst = kst_offset();
+    let now_kst = now_utc.with_timezone(&kst);
+
+    // 기준: "이번주 월요일 00:00(KST)"
+    let this_monday_midnight_kst = this_week_monday_midnight_kst(now_kst);
+
+    // 비교는 모두 UTC로 하므로, 기준 시각을 다시 UTC로 변환
+    let this_monday_midnight_utc = this_monday_midnight_kst.with_timezone(&Utc);
+    let this_monday_9_kst = this_monday_midnight_kst + ChronoDuration::hours(9);
+    let this_monday_9_utc = this_monday_9_kst.with_timezone(&Utc);
+    // "지난주 월요일 09:00(KST)" 기준
+    let last_monday_9_kst = this_monday_9_kst - ChronoDuration::days(7);
+    let last_monday_9_utc = last_monday_9_kst.with_timezone(&Utc);
+
+    // user_id -> 해당 주간 내 첫 메시지 시각 (UTC)
+    let mut first_message_times: HashMap<serenity::model::id::UserId, DateTime<Utc>> = HashMap::new();
+    let mut before: Option<MessageId> = None;
+
+    'outer: loop {
+        let mut builder = GetMessages::new().limit(100);
+
+        if let Some(b) = before {
+            builder = builder.before(b);
+        }
+
+        let messages = message_source_thread_id.messages(http, builder).await?;
+
+        if messages.is_empty() {
+            break;
+        }
+
+        for msg in &messages {
+            if msg.timestamp < last_monday_9_utc.into() {
+                // 지난주 월요일 09:00(KST 기준) 이전 메시지에 도달하면 중단
+                break 'outer;
+            }
+
+            // 이번주 월요일 09:00(KST) 이후 메시지는 이번 체크 기준 밖이므로 무시
+            if msg.timestamp > this_monday_9_utc.into() {
+                continue;
+            }
+
+            if !msg.author.bot {
+                let msg_time = msg.timestamp.to_utc();
+                let entry = first_message_times
+                    .entry(msg.author.id)
+                    .or_insert(msg_time);
+
+                if msg_time < *entry {
+                    *entry = msg_time;
+                }
+            }
+        }
+
+        before = messages.last().map(|m| m.id);
+    }
+
+    // 4) 분류 (blog_study 역할 보유자만)
+    // - 지난주 월요일 09:00 ~ 이번주 월요일 09:00까지 한 번도 작성하지 않으면: 경고
+    // - 지난주 월요일 09:00 ~ 이번주 월요일 00:00까지 작성하지 않았으나,
+    //   이번주 월요일 00:00 ~ 09:00 사이에 처음 작성하면: 지각
+    let mut warn = Vec::new(); // 완전 미참여 (경고)
+    let mut late = Vec::new(); // 이번주 월요일 00:00~09:00 첫 작성 (지각)
+
+    for member in target_members {
+        if let Some(first_ts) = first_message_times.get(&member.user.id) {
+            // 지난주 월요일 09:00 ~ 이번주 월요일 00:00 전에 작성한 경우 → 정상 참여로 간주
+            if *first_ts < this_monday_midnight_utc {
+                continue;
+            }
+
+            // 이번주 월요일 00:00 ~ 09:00 사이에 처음 작성 → 지각
+            if *first_ts >= this_monday_midnight_utc && *first_ts <= this_monday_9_utc {
+                late.push(member);
+            } else {
+                // 그 외 (예: 이번주 월요일 09:00 이후에 처음 작성) → 이번 체크 기준에서는
+                // "이번주 월요일 09시까지 작성하지 않음"이므로 경고
+                warn.push(member);
+            }
+        } else {
+            // 지난주 월요일 09:00 ~ 이번주 월요일 09:00까지 메시지가 전혀 없음 → 경고
+            warn.push(member);
+        }
+    }
+
+    if warn.is_empty() && late.is_empty() {
+        post_channel_id
+            .say(
+                http,
+                &format!(
+                    "지난주 월요일 09:00부터 이번주 월요일 09:00까지 **{role}** 역할 대상자 모두 참여해서, 경고나 지각 대상자가 없습니다!",
+                    role = TARGET_ROLE_NAME
+                ),
+            )
+            .await?;
+        return Ok(());
+    }
+
+    let mut parts = Vec::new();
+
+    if !warn.is_empty() {
+        let mention_list = warn
+            .iter()
+            .map(|m| format!("<@{}>", m.user.id))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        parts.push(format!(
+            "지난주 월요일 09:00부터 이번주 월요일 09:00까지, **{role}** 역할 대상자 중 이 채널에서 가장 최근에 만들어진 스레드에 메시지를 남기지 않아 **경고 1회**를 받은 사람들:\n{mention_list}",
+            role = TARGET_ROLE_NAME,
+            mention_list = mention_list,
+        ));
+    }
+
+    if !late.is_empty() {
+        let mention_list = late
+            .iter()
+            .map(|m| format!("<@{}>", m.user.id))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        parts.push(format!(
+            "이번주 월요일 00:00~09:00 사이에, **{role}** 역할 대상자 중 위 스레드에 처음으로 메시지를 남겨 **지각 1회**를 받은 사람들:\n{mention_list}",
+            role = TARGET_ROLE_NAME,
+            mention_list = mention_list,
+        ));
+    }
+
+    let content = parts.join("\n\n");
+    post_channel_id.say(http, content).await?;
+
+    Ok(())
+}
+
+ #[tokio::main]
+ async fn main() -> Result<()> {
+     dotenvy::dotenv().ok();
+
+     // 환경변수에서 토큰/ID 불러오기
+     let token = env::var("DISCORD_TOKEN")
+         .expect("DISCORD_TOKEN 환경변수를 설정해주세요.");
+     let guild_id: u64 = env::var("TARGET_GUILD_ID")
+         .expect("TARGET_GUILD_ID 환경변수를 설정해주세요.")
+         .parse()
+         .expect("TARGET_GUILD_ID 는 u64 숫자여야 합니다.");
+     let channel_id: u64 = env::var("TARGET_CHANNEL_ID")
+         .expect("TARGET_CHANNEL_ID 환경변수를 설정해주세요.")
+         .parse()
+         .expect("TARGET_CHANNEL_ID 는 u64 숫자여야 합니다.");
+
+     let intents = GatewayIntents::GUILD_MEMBERS
+         | GatewayIntents::GUILD_MESSAGES
+         | GatewayIntents::MESSAGE_CONTENT;
+
+    let handler = Handler {
+        target_guild: GuildId::new(guild_id),
+        target_channel: ChannelId::new(channel_id),
+        started: Arc::new(AtomicBool::new(false)),
+    };
+
+     let mut client = Client::builder(&token, intents)
+         .event_handler(handler)
+         .await
+         .expect("Client 생성 실패");
+
+     if let Err(why) = client.start().await {
+         eprintln!("Client error: {:?}", why);
+     }
+
+     Ok(())
+ }
+
